@@ -24,12 +24,16 @@ MIN_RR = float(_g("MIN_RR", "1.5"))
 WORKERS = int(_g("WORKERS", "4"))
 SCALP_ON = _g("SCALP_ENABLED", "true").lower() == "true"
 SEND_EMPTY = _g("SEND_WHEN_EMPTY", "false").lower() == "true"
+MAX_WATCH = int(_g("MAX_WATCH_ROWS", "15"))
+LB_D = int(_g("LOOKBACK_D", "3"))
+LB_12 = int(_g("LOOKBACK_12H", "3"))
+LB_4 = int(_g("LOOKBACK_4H", "6"))
 EXCLUDE = set(s.strip().upper() for s in _g("EXCLUDE_BASES", "").split(",") if s.strip())
 
 TIERS = {
-    "swing": dict(name="① 코어 스윙", risk=1.0, cap=4.0, maxpos=2, cool=24),
-    "mid":   dict(name="② 중단타",    risk=0.7, cap=2.5, maxpos=3, cool=6),
-    "scalp": dict(name="③ 스캘핑",    risk=0.4, cap=1.5, maxpos=1, cool=2),
+    "swing": dict(name="① 코어 스윙", risk=1.0, cap=4.0, cool=24),
+    "mid":   dict(name="② 중단타",    risk=0.7, cap=2.5, cool=6),
+    "scalp": dict(name="③ 스캘핑",    risk=0.4, cap=1.5, cool=2),
 }
 JP = {"1Dutc": (2.5, 3.0, 12.0), "1H": (3.0, 1.2, 4.0), "30m": (2.3, 0.9, 4.0), "15m": (2.0, 0.7, 4.0)}
 
@@ -105,9 +109,15 @@ def cci(src, n=20):
     return out
 
 
-def crossed_up(s, lv):
+def crossed_recent(s, lv, n=1):
     s = s[np.isfinite(s)]
-    return bool(len(s) >= 2 and s[-2] < lv and s[-1] >= lv)
+    if len(s) < 2 or s[-1] < lv:
+        return 0
+    k = min(n, len(s) - 1)
+    for i in range(1, k + 1):
+        if s[-i - 1] < lv <= s[-i]:
+            return i
+    return 0
 
 
 def klines(instid, bar, limit=250):
@@ -183,7 +193,7 @@ def jade(hlc, params):
     rs = (px - uL) / fR if fR else None
     mid = 43.0 < rr < 57.0
     return dict(px=px, rsi=rr, up=up, dn=dn, prev_low=L1, prev_high=S1,
-                retrL=rl, retrS=rs,
+                retrL=rl, retrS=rs, bull2=bull2, bear2=bear2, rmid=mid,
                 f618=(uH - 0.618 * fR) if fR else None,
                 f786=(uH - 0.786 * fR) if fR else None,
                 s618=(uL + 0.618 * fR) if fR else None,
@@ -196,23 +206,23 @@ def stage1(instid):
     k = klines(instid, "1Dutc", 250)
     if k is None:
         return None
-    h, l, c, _ = k
+    c = k[2]
     s22 = sma(c, 22)
     b20 = sma(c, 20)
     if not np.isfinite(s22[-1]):
         return None
     j = jade(k, JP["1Dutc"])
-    return dict(close=float(c[-1]), above=bool(c[-1] > s22[-1]), sma22=float(s22[-1]),
+    return dict(close=float(c[-1]), above=bool(c[-1] > s22[-1]),
                 bbmid=float(b20[-1]) if np.isfinite(b20[-1]) else None,
-                cci_d=crossed_up(cci(c), -100),
+                cci_d=crossed_recent(cci(c), -100, LB_D),
                 prev_high=(j or {}).get("prev_high"))
 
 
 def stage2(instid):
-    out = dict(c12=False, c4=False, volx=None, bb4=None)
+    out = dict(c12=0, c4=0, volx=None, bb4=None)
     k = klines(instid, "12Hutc", 250)
     if k is not None:
-        out["c12"] = crossed_up(cci(k[2]), -80)
+        out["c12"] = crossed_recent(cci(k[2]), -80, LB_12)
     k = klines(instid, "4H", 250)
     if k is not None:
         c4, v4 = k[2], k[3]
@@ -221,36 +231,13 @@ def stage2(instid):
             out["volx"] = float(v4[-1] / vm[-1])
         b = sma(c4, 20)
         out["bb4"] = float(b[-1]) if np.isfinite(b[-1]) else None
-        out["c4"] = crossed_up(cci(c4), -100) and bool(out["volx"] and out["volx"] >= 1.5)
+        n = crossed_recent(cci(c4), -100, LB_4)
+        out["c4"] = n if (n and out["volx"] and out["volx"] >= 1.5) else 0
     return out
 
 
 def stage3(instid):
     return {tf: jade(klines(instid, tf, 250), JP[tf]) for tf in ("1H", "30m", "15m")}
-
-
-def mk(instid, tier, side, ref, zone_lo, zone_hi, raw_stop, tp1, tp2, why, tf_tag):
-    t = TIERS[tier]
-    if ref is None or raw_stop is None or tp1 is None:
-        return None
-    if side == "long":
-        stop = max(raw_stop, ref * (1 - t["cap"] / 100.0))
-        if stop >= ref or tp1 <= ref:
-            return None
-        risk_d, rew_d = ref - stop, tp1 - ref
-    else:
-        stop = min(raw_stop, ref * (1 + t["cap"] / 100.0))
-        if stop <= ref or tp1 >= ref:
-            return None
-        risk_d, rew_d = stop - ref, ref - tp1
-    rr = rew_d / risk_d
-    if rr < MIN_RR:
-        return None
-    stop_pct = risk_d / ref * 100.0
-    pos_usd = (ACCOUNT * t["risk"] / 100.0) / (stop_pct / 100.0)
-    return dict(instid=instid, tier=tier, side=side, ref=ref, stop=stop, stop_pct=stop_pct,
-                zlo=zone_lo, zhi=zone_hi, tp1=tp1, tp2=tp2, rr=rr,
-                pos=pos_usd, qty=pos_usd / ref, why=why, tf=tf_tag)
 
 
 def pick_tp(ref, side, cands):
@@ -264,48 +251,95 @@ def pick_tp(ref, side, cands):
     return ups[0], (ups[1] if len(ups) > 1 else None)
 
 
-def build(instid, s1, s2, j, scalp_ok):
-    out = []
+def mk(tier, side, ref, zlo, zhi, raw_stop, tp1, tp2):
+    t = TIERS[tier]
+    if ref is None or raw_stop is None or tp1 is None:
+        return None
+    if side == "long":
+        stop = max(raw_stop, ref * (1 - t["cap"] / 100.0))
+        if stop >= ref or tp1 <= ref:
+            return None
+        rd, wd = ref - stop, tp1 - ref
+    else:
+        stop = min(raw_stop, ref * (1 + t["cap"] / 100.0))
+        if stop <= ref or tp1 >= ref:
+            return None
+        rd, wd = stop - ref, ref - tp1
+    rr = wd / rd
+    if rr < MIN_RR:
+        return None
+    sp = rd / ref * 100.0
+    pos = (ACCOUNT * t["risk"] / 100.0) / (sp / 100.0)
+    return dict(tier=tier, side=side, ref=ref, stop=stop, stop_pct=sp,
+                zlo=zlo, zhi=zhi, tp1=tp1, tp2=tp2, rr=rr, pos=pos, qty=pos / ref)
+
+
+def analyze_coin(instid, s1, s2, j, scalp_ok):
     h1 = j.get("1H")
-    if s1["above"] and (s1["cci_d"] or s2["c12"]) and h1 and h1["longEntry"]:
-        src = "일봉 CCI -100 상향" if s1["cci_d"] else "12h CCI -80 상향"
-        tp1, tp2 = pick_tp(h1["px"], "long", [h1["prev_high"], s1["bbmid"], s1["prev_high"]])
-        p = mk(instid, "swing", "long", h1["px"], h1["f786"], h1["f618"], h1["prev_low"],
-               tp1, tp2,
-               f"4BC {src} · 일봉 SMA22 위  /  제이드 1H 롱진입(되돌림 {h1['retrL']*100:.0f}%)", "1H")
-        if p:
-            out.append(p)
-    if s1["above"] and s2["c4"] and h1 and h1["up"]:
-        for tf in ("30m", "15m"):
+    if h1 is None:
+        return None
+
+    bc = []
+    if s1["above"]:
+        if s1["cci_d"]:
+            bc.append(("swing", f"일봉 CCI -100 반전 ({s1['cci_d']}봉 전)"))
+        if s2["c12"]:
+            bc.append(("swing", f"12h CCI -80 반전 ({s2['c12']}봉 전)"))
+        if s2["c4"]:
+            bc.append(("mid", f"4H CCI -100 반전 ({s2['c4']}봉 전) · 거래량 {s2['volx']:.1f}x"))
+
+    jd_tf = jd_a = jd_side = None
+    if s1["above"]:
+        for tf in ("1H", "30m", "15m"):
             a = j.get(tf)
-            if a and a["longEntry"]:
-                tp1, tp2 = pick_tp(a["px"], "long",
-                                   [a["prev_high"], h1["prev_high"], s2["bb4"], s1["prev_high"]])
-                p = mk(instid, "mid", "long", a["px"], a["f786"], a["f618"], a["prev_low"],
-                       tp1, tp2,
-                       f"4BC 4H CCI -100 상향 · 거래량 {s2['volx']:.1f}x · 일봉 SMA22 위"
-                       f"  /  제이드 1H 상승파동 + {tf} 롱진입(되돌림 {a['retrL']*100:.0f}%)", tf)
-                if p:
-                    out.append(p)
-                    break
-    if scalp_ok:
+            if a and a["longEntry"] and (tf == "1H" or h1["up"]):
+                jd_tf, jd_a, jd_side = tf, a, "long"
+                break
+    elif scalp_ok:
         h30, s15 = j.get("30m"), j.get("15m")
-        if h1 and h30 and s15:
-            if s1["above"] and h1["up"] and h30["up"] and s15["longEntry"]:
-                r1 = s15["px"] - max(s15["prev_low"] or 0, s15["px"] * 0.985)
-                p = mk(instid, "scalp", "long", s15["px"], s15["f786"], s15["f618"], s15["prev_low"],
-                       s15["px"] + r1, s15["px"] + 1.5 * r1,
-                       "제이드 15m A급(3TF 정렬) · 일봉 SMA22 위", "15m")
-                if p:
-                    out.append(p)
-            elif (not s1["above"]) and h1["dn"] and h30["dn"] and s15["shortEntry"]:
-                r1 = min(s15["prev_high"] or 1e18, s15["px"] * 1.015) - s15["px"]
-                p = mk(instid, "scalp", "short", s15["px"], s15["s618"], s15["s786"], s15["prev_high"],
-                       s15["px"] - r1, s15["px"] - 1.5 * r1,
-                       "제이드 15m A급(3TF 정렬) · 일봉 SMA22 아래", "15m")
-                if p:
-                    out.append(p)
-    return out
+        if h30 and s15 and h1["dn"] and h30["dn"] and s15["shortEntry"]:
+            jd_tf, jd_a, jd_side = "15m", s15, "short"
+
+    if not bc and jd_tf is None:
+        return None
+
+    if jd_side == "short":
+        tier = "scalp"
+    elif any(t == "swing" for t, _ in bc) and jd_tf == "1H":
+        tier = "swing"
+    else:
+        tier = "mid"
+
+    plan = None
+    if jd_tf and jd_side == "long":
+        tp1, tp2 = pick_tp(jd_a["px"], "long",
+                           [jd_a["prev_high"], h1["prev_high"], s2["bb4"],
+                            s1["bbmid"], s1["prev_high"]])
+        plan = mk(tier, "long", jd_a["px"], jd_a["f786"], jd_a["f618"],
+                  jd_a["prev_low"], tp1, tp2)
+    elif jd_tf and jd_side == "short":
+        r1 = min(jd_a["prev_high"] or 1e18, jd_a["px"] * 1.015) - jd_a["px"]
+        plan = mk("scalp", "short", jd_a["px"], jd_a["s618"], jd_a["s786"],
+                  jd_a["prev_high"], jd_a["px"] - r1, jd_a["px"] - 1.5 * r1)
+
+    zone = None
+    if bc and plan is None:
+        for tf in ("30m", "1H"):
+            a = j.get(tf)
+            if a and a["f618"] and a["f786"]:
+                zone = (tf, min(a["f786"], a["f618"]), max(a["f786"], a["f618"]), a["px"])
+                break
+
+    kind = "both" if (bc and plan) else ("bc" if bc else "jade")
+    jdesc = ""
+    if jd_tf:
+        d = "롱" if jd_side == "long" else "숏"
+        rv = jd_a["retrL"] if jd_side == "long" else jd_a["retrS"]
+        dv = "상승DIV" if jd_side == "long" else "하락DIV"
+        wv = "상승파동" if jd_side == "long" else "하락파동"
+        jdesc = f"1H {wv} / {jd_tf} {d}진입 되돌림 {rv*100:.0f}% + {dv}"
+    return dict(instid=instid, kind=kind, bc=bc, plan=plan, zone=zone,
+                tier=tier, jdesc=jdesc, jtf=jd_tf, px=s1["close"])
 
 
 def fp(p):
@@ -322,23 +356,29 @@ def sym(i):
     return i.split("-")[0] + "USDT"
 
 
-def card(p):
+def card(rec, star=False):
+    p = rec["plan"]
     t = TIERS[p["tier"]]
     e = "\U0001F7E2" if p["side"] == "long" else "\U0001F534"
-    sd = "롱" if p["side"] == "long" else "숏"
     zs = sorted([x for x in (p["zlo"], p["zhi"]) if x is not None])
-    lo = zs[0] if zs else None
-    hi = zs[-1] if zs else None
-    L = [f"{e} <b>[{t['name']}]</b> {sym(p['instid'])}  현재 {fp(p['ref'])}  <i>{sd}</i>",
-         f"  {p['why']}",
-         "  ───────────────",
-         f"  진입   {fp(lo)} ~ {fp(hi)}   <i>({p['tf']} 피보 0.618~0.786)</i>",
-         f"  손절   {fp(p['stop'])}   <i>({p['stop_pct']:.1f}%)</i>",
-         f"  익절1  {fp(p['tp1'])}   <i>50% 청산 → 손절 본절로</i>",
-         f"  익절2  {fp(p['tp2'])}",
-         f"  손익비 1 : {p['rr']:.1f}",
-         f"  수량   계좌 ${ACCOUNT:,.0f} · 리스크 {t['risk']}% → <b>${p['pos']:,.0f}</b> ({p['qty']:,.4f})"]
+    lo, hi = (zs[0], zs[-1]) if zs else (None, None)
+    head = ("⭐ " if star else "") + f"{e} <b>{sym(rec['instid'])}</b>  {fp(p['ref'])}  <i>[{t['name']}]</i>"
+    L = [head]
+    if rec["bc"]:
+        L.append("  <b>4BC</b>  " + " · ".join(d for _, d in rec["bc"]))
+    if rec["jdesc"]:
+        L.append("  <b>제이드</b>  " + rec["jdesc"])
+    L += [f"  진입 {fp(lo)} ~ {fp(hi)}  |  손절 {fp(p['stop'])} ({p['stop_pct']:.1f}%)",
+          f"  익절1 {fp(p['tp1'])}  |  익절2 {fp(p['tp2'])}  |  손익비 1:{p['rr']:.1f}",
+          f"  수량 <b>${p['pos']:,.0f}</b> ({p['qty']:,.4f})  리스크 {t['risk']}%"]
     return "\n".join(L)
+
+
+def watch_line(rec):
+    tf, lo, hi, px = rec["zone"]
+    gap = (px - hi) / px * 100.0
+    return (f"  · <b>{sym(rec['instid'])}</b> {fp(px)} → 진입존 {fp(hi)}~{fp(lo)} "
+            f"<i>({tf}, {gap:+.1f}%)</i>")
 
 
 def send(txt):
@@ -392,7 +432,7 @@ def main():
             vol[t["instId"]] = 0.0
     syms = [s for s in syms if vol.get(s, 0) >= MIN_VOL]
     syms.sort(key=lambda s: -vol.get(s, 0))
-    print(f"[1] universe {len(syms)}  scalp_window={scalp_ok}")
+    print(f"[1] universe {len(syms)}  scalp={scalp_ok}")
 
     s1m = {}
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
@@ -404,8 +444,8 @@ def main():
                 r = None
             if r:
                 s1m[fu[f]] = r
-    cand = [s for s in syms if s in s1m and (s1m[s]["above"] or scalp_ok)]
-    print(f"[2] after daily screen {len(cand)}")
+    cand = [s for s in syms if s in s1m]
+    print(f"[2] daily ok {len(cand)}  (above SMA22: {sum(1 for s in cand if s1m[s]['above'])})")
 
     s2m = {}
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
@@ -415,53 +455,77 @@ def main():
                 s2m[fu[f]] = f.result()
             except Exception:
                 pass
-    hot = [s for s in cand if s in s2m and (s1m[s]["cci_d"] or s2m[s]["c12"] or s2m[s]["c4"])]
-    if scalp_ok:
-        hot = list(dict.fromkeys(hot + cand[:30]))
-    print(f"[3] 4BC hits + scalp pool {len(hot)}")
 
-    plans = []
+    hot = [s for s in cand if s in s2m and s1m[s]["above"]
+           and (s1m[s]["cci_d"] or s2m[s]["c12"] or s2m[s]["c4"])]
+    pool = list(dict.fromkeys(hot + [s for s in cand if s1m[s]["above"]][:40]
+                              + (cand[:20] if scalp_ok else [])))
+    print(f"[3] 4BC hits {len(hot)}  ·  jade pool {len(pool)}")
+
+    recs = []
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        fu = {ex.submit(stage3, s): s for s in hot}
+        fu = {ex.submit(stage3, s): s for s in pool}
         for f in as_completed(fu):
             s = fu[f]
             try:
                 j = f.result()
             except Exception:
                 continue
-            plans += build(s, s1m[s], s2m.get(s, dict(c12=False, c4=False, volx=None, bb4=None)),
-                           j, scalp_ok)
-    print(f"[4] plans passing RR>={MIN_RR} : {len(plans)}")
+            r = analyze_coin(s, s1m[s], s2m.get(s, dict(c12=0, c4=0, volx=None, bb4=None)),
+                             j, scalp_ok)
+            if r:
+                recs.append(r)
+
+    both = [r for r in recs if r["kind"] == "both"]
+    jonly = [r for r in recs if r["kind"] == "jade"]
+    bonly = [r for r in recs if r["kind"] == "bc" and r["zone"]]
+    print(f"[4] both {len(both)} · jade-only {len(jonly)} · 4bc-only {len(bonly)}")
 
     now = datetime.datetime.now(datetime.timezone.utc)
     st = {k: v for k, v in (json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}).items()
           if pdt(v) and pdt(v) > now - datetime.timedelta(hours=72)}
-    fresh = []
-    for p in plans:
-        key = f"{sym(p['instid'])}:{p['tier']}:{p['side']}"
-        prev = pdt(st.get(key))
-        if prev and (now - prev).total_seconds() < TIERS[p["tier"]]["cool"] * 3600:
-            continue
-        fresh.append(p)
-        st[key] = now.isoformat()
+
+    def fresh(lst):
+        out = []
+        for r in lst:
+            key = f"{sym(r['instid'])}:{r['plan']['tier']}:{r['plan']['side']}"
+            pv = pdt(st.get(key))
+            if pv and (now - pv).total_seconds() < TIERS[r["plan"]["tier"]]["cool"] * 3600:
+                continue
+            out.append(r)
+            st[key] = now.isoformat()
+        return out
+
+    both_f, jonly_f = fresh(both), fresh(jonly)
     json.dump(st, open(STATE_FILE, "w"))
 
-    stamp = nk.strftime("%Y-%m-%d %H:%M")
-    funnel = (f"전종목 {len(syms)} → 추세통과 {len(cand)} → 4BC히트 {len(hot)} "
-              f"→ 플랜 {len(plans)} → 신규 {len(fresh)}")
-    if not fresh:
-        print("no fresh plans")
-        if SEND_EMPTY:
-            send(f"\U0001F4CB <b>매매 플랜</b> · {stamp} KST · 신호 없음\n<i>{funnel}</i>")
-        return
+    for lst in (both_f, jonly_f, bonly):
+        lst.sort(key=lambda r: -vol.get(r["instid"], 0))
 
-    rank = {"swing": 0, "mid": 1, "scalp": 2}
-    fresh.sort(key=lambda p: (rank[p["tier"]], -p["rr"]))
-    head = (f"\U0001F4CB <b>매매 플랜</b> · {stamp} KST · {len(fresh)}건\n"
-            f"<i>{funnel}</i>\n"
-            f"<i>동시 보유 ① 2 / ② 3 / ③ 1 · 총 리스크 4% 상한 · "
-            f"진입과 동시에 손절 주문 등록</i>")
-    for ch in split(head + "\n\n" + "\n\n".join(card(p) for p in fresh)):
+    stamp = nk.strftime("%Y-%m-%d %H:%M")
+    blocks = [f"\U0001F4CB <b>스캔</b> · {stamp} KST\n"
+              f"<i>전종목 {len(syms)} · 4BC히트 {len(hot)} · "
+              f"겹침 {len(both_f)} / 제이드단독 {len(jonly_f)} / 4BC단독 {len(bonly)}</i>"]
+
+    if both_f:
+        blocks.append("━━━ ⭐ <b>겹침 (4BC + 제이드)</b> ━━━")
+        blocks += [card(r, star=True) for r in both_f]
+    if jonly_f:
+        blocks.append("━━━ \U0001F30A <b>제이드 단독</b> ━━━")
+        blocks += [card(r) for r in jonly_f]
+    if bonly:
+        rows = [watch_line(r) for r in bonly[:MAX_WATCH]]
+        extra = f"\n  …외 {len(bonly)-MAX_WATCH}개" if len(bonly) > MAX_WATCH else ""
+        blocks.append("━━━ \U0001F4CA <b>4BC 단독 — 진입존 대기</b> ━━━\n"
+                      + "\n".join(rows) + extra)
+
+    if len(blocks) == 1:
+        print("nothing to send")
+        if SEND_EMPTY:
+            send(blocks[0] + "\n\n신호 없음")
+        return
+    blocks.append("<i>동시 보유 ① 2 / ② 3 / ③ 1 · 총 리스크 4% 상한 · 진입과 동시에 손절 주문 등록</i>")
+    for ch in split("\n\n".join(blocks)):
         send(ch)
         time.sleep(0.4)
 
