@@ -362,7 +362,10 @@ def card(rec, star=False):
     e = "\U0001F7E2" if p["side"] == "long" else "\U0001F534"
     zs = sorted([x for x in (p["zlo"], p["zhi"]) if x is not None])
     lo, hi = (zs[0], zs[-1]) if zs else (None, None)
-    head = ("⭐ " if star else "") + f"{e} <b>{sym(rec['instid'])}</b>  {fp(p['ref'])}  <i>[{t['name']}]</i>"
+    drift = ""
+    if rec.get("live") and abs(rec["live"] - p["ref"]) / p["ref"] > 0.002:
+        drift = f" <i>(신호가 {fp(p['ref'])})</i>"
+    head = ("⭐ " if star else "") + f"{e} <b>{sym(rec['instid'])}</b>  현재 {fp(rec.get('live') or p['ref'])}{drift}  <i>[{t['name']}]</i>"
     L = [head]
     if rec["bc"]:
         L.append("  <b>4BC</b>  " + " · ".join(d for _, d in rec["bc"]))
@@ -375,7 +378,8 @@ def card(rec, star=False):
 
 
 def watch_line(rec):
-    tf, lo, hi, px = rec["zone"]
+    tf, lo, hi, _ = rec["zone"]
+    px = rec["live"]
     gap = (px - hi) / px * 100.0
     return (f"  · <b>{sym(rec['instid'])}</b> {fp(px)} → 진입존 {fp(hi)}~{fp(lo)} "
             f"<i>({tf}, {gap:+.1f}%)</i>")
@@ -424,12 +428,15 @@ def main():
             and it.get("instId", "").endswith("-USDT-SWAP")
             and it["instId"].split("-")[0].upper() not in EXCLUDE]
     tk = okx_get("/api/v5/market/tickers", {"instType": "SWAP"}) or []
-    vol = {}
+    vol, live = {}, {}
     for t in tk:
         try:
-            vol[t["instId"]] = float(t.get("volCcy24h") or 0) * float(t.get("last") or 0)
+            lp = float(t.get("last") or 0)
+            live[t["instId"]] = lp
+            vol[t["instId"]] = float(t.get("volCcy24h") or 0) * lp
         except (TypeError, ValueError):
             vol[t["instId"]] = 0.0
+            live[t["instId"]] = 0.0
     syms = [s for s in syms if vol.get(s, 0) >= MIN_VOL]
     syms.sort(key=lambda s: -vol.get(s, 0))
     print(f"[1] universe {len(syms)}  scalp={scalp_ok}")
@@ -474,11 +481,13 @@ def main():
             r = analyze_coin(s, s1m[s], s2m.get(s, dict(c12=0, c4=0, volx=None, bb4=None)),
                              j, scalp_ok)
             if r:
+                r["live"] = live.get(s) or r["px"]
                 recs.append(r)
 
     both = [r for r in recs if r["kind"] == "both"]
     jonly = [r for r in recs if r["kind"] == "jade"]
-    bonly = [r for r in recs if r["kind"] == "bc" and r["zone"]]
+    bonly = [r for r in recs if r["kind"] == "bc" and r["zone"]
+             and r["live"] > r["zone"][2]]
     print(f"[4] both {len(both)} · jade-only {len(jonly)} · 4bc-only {len(bonly)}")
 
     now = datetime.datetime.now(datetime.timezone.utc)
