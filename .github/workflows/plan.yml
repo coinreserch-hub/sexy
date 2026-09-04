@@ -27,6 +27,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ACCOUNT_USDT: ${{ secrets.ACCOUNT_USDT }}
+          SEND_WHEN_EMPTY: "true"
         run: python plan_bot.py
       - name: persist state
         run: |
@@ -35,4 +36,3 @@ jobs:
           git add plan_state.json || true
           git commit -m "plan state" || echo "no change"
           git push || echo "push skipped"
-          SEND_WHEN_EMPTY: "true"
