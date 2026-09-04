@@ -35,3 +35,4 @@ jobs:
           git add plan_state.json || true
           git commit -m "plan state" || echo "no change"
           git push || echo "push skipped"
+          SEND_WHEN_EMPTY: "true"
