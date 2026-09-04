@@ -253,31 +253,43 @@ def mk(instid, tier, side, ref, zone_lo, zone_hi, raw_stop, tp1, tp2, why, tf_ta
                 pos=pos_usd, qty=pos_usd / ref, why=why, tf=tf_tag)
 
 
+def pick_tp(ref, side, cands):
+    vals = [c for c in cands if c is not None]
+    if side == "long":
+        ups = sorted([c for c in vals if c > ref * 1.001])
+    else:
+        ups = sorted([c for c in vals if c < ref * 0.999], reverse=True)
+    if not ups:
+        return None, None
+    return ups[0], (ups[1] if len(ups) > 1 else None)
+
+
 def build(instid, s1, s2, j, scalp_ok):
     out = []
-    if s1["above"] and (s1["cci_d"] or s2["c12"]):
-        a = j.get("1H")
-        if a and a["longEntry"]:
-            src = "일봉 CCI -100 상향" if s1["cci_d"] else "12h CCI -80 상향"
-            p = mk(instid, "swing", "long", a["px"], a["f786"], a["f618"], a["prev_low"],
-                   s1["bbmid"], s1["prev_high"],
-                   f"4BC {src} · 일봉 SMA22 위  /  제이드 1H 롱진입(되돌림 {a['retrL']*100:.0f}%)", "1H")
-            if p:
-                out.append(p)
-    if s1["above"] and s2["c4"]:
-        h1 = j.get("1H")
+    h1 = j.get("1H")
+    if s1["above"] and (s1["cci_d"] or s2["c12"]) and h1 and h1["longEntry"]:
+        src = "일봉 CCI -100 상향" if s1["cci_d"] else "12h CCI -80 상향"
+        tp1, tp2 = pick_tp(h1["px"], "long", [h1["prev_high"], s1["bbmid"], s1["prev_high"]])
+        p = mk(instid, "swing", "long", h1["px"], h1["f786"], h1["f618"], h1["prev_low"],
+               tp1, tp2,
+               f"4BC {src} · 일봉 SMA22 위  /  제이드 1H 롱진입(되돌림 {h1['retrL']*100:.0f}%)", "1H")
+        if p:
+            out.append(p)
+    if s1["above"] and s2["c4"] and h1 and h1["up"]:
         for tf in ("30m", "15m"):
             a = j.get(tf)
-            if h1 and h1["up"] and a and a["longEntry"]:
+            if a and a["longEntry"]:
+                tp1, tp2 = pick_tp(a["px"], "long",
+                                   [a["prev_high"], h1["prev_high"], s2["bb4"], s1["prev_high"]])
                 p = mk(instid, "mid", "long", a["px"], a["f786"], a["f618"], a["prev_low"],
-                       s2["bb4"], (h1 or {}).get("prev_high"),
+                       tp1, tp2,
                        f"4BC 4H CCI -100 상향 · 거래량 {s2['volx']:.1f}x · 일봉 SMA22 위"
                        f"  /  제이드 1H 상승파동 + {tf} 롱진입(되돌림 {a['retrL']*100:.0f}%)", tf)
                 if p:
                     out.append(p)
                     break
     if scalp_ok:
-        h1, h30, s15 = j.get("1H"), j.get("30m"), j.get("15m")
+        h30, s15 = j.get("30m"), j.get("15m")
         if h1 and h30 and s15:
             if s1["above"] and h1["up"] and h30["up"] and s15["longEntry"]:
                 r1 = s15["px"] - max(s15["prev_low"] or 0, s15["px"] * 0.985)
@@ -435,15 +447,18 @@ def main():
     json.dump(st, open(STATE_FILE, "w"))
 
     stamp = nk.strftime("%Y-%m-%d %H:%M")
+    funnel = (f"전종목 {len(syms)} → 추세통과 {len(cand)} → 4BC히트 {len(hot)} "
+              f"→ 플랜 {len(plans)} → 신규 {len(fresh)}")
     if not fresh:
         print("no fresh plans")
         if SEND_EMPTY:
-            send(f"\U0001F4CB <b>매매 플랜</b> · {stamp} KST · 신호 없음")
+            send(f"\U0001F4CB <b>매매 플랜</b> · {stamp} KST · 신호 없음\n<i>{funnel}</i>")
         return
 
     rank = {"swing": 0, "mid": 1, "scalp": 2}
     fresh.sort(key=lambda p: (rank[p["tier"]], -p["rr"]))
     head = (f"\U0001F4CB <b>매매 플랜</b> · {stamp} KST · {len(fresh)}건\n"
+            f"<i>{funnel}</i>\n"
             f"<i>동시 보유 ① 2 / ② 3 / ③ 1 · 총 리스크 4% 상한 · "
             f"진입과 동시에 손절 주문 등록</i>")
     for ch in split(head + "\n\n" + "\n\n".join(card(p) for p in fresh)):
