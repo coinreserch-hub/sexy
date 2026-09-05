@@ -184,8 +184,8 @@ def jade(hlc, params):
     rr = float(r[-1]) if np.isfinite(r[-1]) else 50.0
     up = L1 is not None and L2 is not None and L1 > L2 and px > L1
     dn = S1 is not None and S2 is not None and S1 < S2 and px < S1
-    bull2 = None not in (L1, L2, L1r, L2r) and L1 < L2 and L1r > L2r
-    bear2 = None not in (S1, S2, S1r, S2r) and S1 > S2 and S1r < S2r
+    bull2 = L1 is not None and L1r is not None and rr > L1r
+    bear2 = S1 is not None and S1r is not None and rr < S1r
     uL = L2 if (L1 is not None and px < L1 and L2 is not None) else L1
     uH = S2 if (S1 is not None and px > S1 and S2 is not None) else S1
     fR = (uH - uL) if (uH is not None and uL is not None and uH > uL) else None
@@ -330,7 +330,7 @@ def analyze_coin(instid, s1, s2, j, scalp_ok):
                 zone = (tf, min(a["f786"], a["f618"]), max(a["f786"], a["f618"]), a["px"])
                 break
 
-    kind = "both" if (bc and plan) else ("bc" if bc else "jade")
+    kind = "both" if (bc and plan) else ("jade" if plan else ("bc" if bc else "none"))
     jdesc = ""
     if jd_tf:
         d = "롱" if jd_side == "long" else "숏"
@@ -480,7 +480,7 @@ def main():
                 continue
             r = analyze_coin(s, s1m[s], s2m.get(s, dict(c12=0, c4=0, volx=None, bb4=None)),
                              j, scalp_ok)
-            if r:
+            if r and r["kind"] != "none":
                 r["live"] = live.get(s) or r["px"]
                 recs.append(r)
 
